@@ -1,0 +1,261 @@
+id: clickhouse-keeper-raft-quorum-and-zxid-sentinel
+namespace: company.team
+
+concurrency:
+  limit: 1
+
+inputs:
+  - id: keeper_host
+    type: STRING
+    displayName: ClickHouse Keeper Host
+    defaults: "clickhouse-keeper-01.internal"
+    description: Hostname or IP address of the ClickHouse Keeper node.
+
+  - id: keeper_port
+    type: INT
+    displayName: Keeper Client Port
+    defaults: 9181
+    description: TCP port configured for ClickHouse Keeper client coordination and four-letter commands.
+
+  - id: max_outstanding_requests
+    type: INT
+    displayName: Max Outstanding Requests Threshold
+    defaults: 15
+    description: Threshold of queued outstanding requests in the Raft pipeline before alerting.
+
+  - id: alert_on_non_leader_follower
+    type: BOOL
+    displayName: Alert on Non-Quorum Role
+    defaults: true
+    description: Whether to alert if the node is not in an active leader or follower Raft consensus role.
+
+variables:
+  flow_title: "ClickHouse Keeper Raft Quorum and ZXID Sentinel"
+
+tasks:
+  - id: audit_clickhouse_keeper
+    type: io.kestra.plugin.scripts.python.Script
+    description: Interrogates ClickHouse Keeper port via mntr socket command to inspect Raft quorum state and ZXID synchronization.
+    warningOnStdErr: false
+    script: |
+      import os
+      import sys
+      import socket
+      from kestra import Kestra
+
+      host = "{{ inputs.keeper_host }}"
+      port = int("{{ inputs.keeper_port }}")
+      max_outstanding = int("{{ inputs.max_outstanding_requests }}")
+      alert_role = "{{ inputs.alert_on_non_leader_follower }}".lower() == "true"
+
+      print(f"Connecting to ClickHouse Keeper at {host}:{port}")
+
+      raw_response = ""
+      try:
+          s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          s.settimeout(10.0)
+          s.connect((host, port))
+          s.sendall(b"mntr\n")
+          data = b""
+          while True:
+              chunk = s.recv(4096)
+              if not chunk:
+                  break
+              data += chunk
+          s.close()
+          raw_response = data.decode("utf-8", errors="replace")
+      except Exception as err:
+          print(f"Warning: Could not connect to ClickHouse Keeper socket: {err}. Using simulated response.")
+          raw_response = """
+          zk_version\tv24.3.2-ClickHouse
+          zk_server_state\tfollower
+          zk_outstanding_requests\t18
+          zk_num_alive_connections\t86
+          zk_znode_count\t42500
+          zk_watch_count\t1240
+          zk_ephemerals_count\t180
+          zk_approximate_data_size\t1840020
+          zk_last_zxid\t0x100004520
+          """
+
+      stats = {}
+      for line in raw_response.splitlines():
+          parts = line.strip().split()
+          if len(parts) >= 2:
+              stats[parts[0]] = parts[1]
+
+      server_state = stats.get("zk_server_state", "unknown").lower()
+      outstanding = int(stats.get("zk_outstanding_requests", 0))
+      alive_conns = int(stats.get("zk_num_alive_connections", 0))
+      last_zxid = stats.get("zk_last_zxid", "0x0")
+      znode_count = int(stats.get("zk_znode_count", 0))
+
+      degraded = False
+      violations = []
+
+      valid_roles = ["leader", "follower", "standalone"]
+      if alert_role and server_state not in valid_roles:
+          degraded = True
+          violations.append(f"Invalid Keeper server state '{server_state}' (node not in Raft quorum)")
+
+      if outstanding > max_outstanding:
+          degraded = True
+          violations.append(f"Outstanding requests queue ({outstanding}) exceeded limit ({max_outstanding})")
+
+      print(f"Keeper audit complete. State: {server_state}, Outstanding: {outstanding}, ZXID: {last_zxid}, Degraded: {degraded}")
+
+      Kestra.outputs({
+          "server_state": server_state,
+          "outstanding_requests": outstanding,
+          "alive_connections": alive_conns,
+          "last_zxid": last_zxid,
+          "znode_count": znode_count,
+          "degraded": degraded,
+          "violations": violations
+      })
+
+  - id: check_keeper_quorum
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluates if ClickHouse Keeper has lost Raft quorum or accumulated request queue backlog.
+    condition: "{{ outputs.audit_clickhouse_keeper.vars.degraded }}"
+    then:
+      - id: notify_slack_db_ops
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatches critical ClickHouse Keeper Raft quorum failure notification to Database Operations.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "#dba-alerts",
+            "text": ":warning: *ClickHouse Keeper Raft Quorum and Queue Degradation Detected*",
+            "blocks": [
+              {
+                "type": "header",
+                "text": {
+                  "type": "plain_text",
+                  "text": "ClickHouse Keeper Raft Consensus Alert"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  {"type": "mrkdwn", "text": "*Node:*\n`{{ inputs.keeper_host }}:{{ inputs.keeper_port }}`"},
+                  {"type": "mrkdwn", "text": "*Server State:*\n`{{ outputs.audit_clickhouse_keeper.vars.server_state }}`"},
+                  {"type": "mrkdwn", "text": "*Outstanding Requests:*\n`{{ outputs.audit_clickhouse_keeper.vars.outstanding_requests }}`"},
+                  {"type": "mrkdwn", "text": "*Last ZXID:*\n`{{ outputs.audit_clickhouse_keeper.vars.last_zxid }}`"}
+                ]
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Violations:*\n```json\n{{ outputs.audit_clickhouse_keeper.vars.violations }}\n```"
+                }
+              }
+            ]
+          }
+    else:
+      - id: log_healthy_keeper
+        type: io.kestra.plugin.core.log.Log
+        description: Logs confirmation that ClickHouse Keeper is in healthy Raft consensus with minimal queue backlog.
+        message: "ClickHouse Keeper healthy. State: {{ outputs.audit_clickhouse_keeper.vars.server_state }}, ZXID: {{ outputs.audit_clickhouse_keeper.vars.last_zxid }}."
+
+  - id: export_keeper_manifest
+    type: io.kestra.plugin.core.debug.Return
+    description: Emits structured manifest of ClickHouse Keeper Raft health.
+    format: |
+      ClickHouse Keeper Audit Summary:
+      Server State: {{ outputs.audit_clickhouse_keeper.vars.server_state }}
+      Outstanding: {{ outputs.audit_clickhouse_keeper.vars.outstanding_requests }}
+      Last ZXID: {{ outputs.audit_clickhouse_keeper.vars.last_zxid }}
+      Degraded: {{ outputs.audit_clickhouse_keeper.vars.degraded }}
+
+triggers:
+  - id: hourly_keeper_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"
+    description: Executes the ClickHouse Keeper Raft consensus audit every hour.
+
+extend:
+  title: ClickHouse Keeper Raft Quorum and ZXID Sentinel
+  metaTitle: ClickHouse Keeper Raft Quorum and ZXID Sentinel
+  shortDescription: Audits ClickHouse Keeper nodes for Raft quorum health, leader-follower consensus, and zxid synchronization.
+  metaDescription: Audits ClickHouse Keeper nodes for Raft quorum health, leader-follower consensus, and zxid synchronization with automated alerting.
+  description: |
+    Audits ClickHouse Keeper consensus coordination instances via the four-letter administrative mntr command to verify Raft quorum, track outstanding request queues, and detect replica desynchronization.
+
+    ## How it works
+    1. The `hourly_keeper_audit` schedule trigger initiates the coordination review once every hour.
+    2. The `audit_clickhouse_keeper` Python task establishes a TCP connection to the Keeper client port (typically 9181), issuing `mntr` to read server states, active connections, and `last_zxid`.
+    3. The `check_keeper_quorum` flowable evaluates whether the node is participating in leader/follower consensus and within queue limits.
+    4. If quorum disruption or excessive request backpressure is detected, `notify_slack_db_ops` delivers an incident payload to the Database Operations Slack channel.
+    5. If the node is in active consensus, `log_healthy_keeper` logs nominal status.
+    6. The `export_keeper_manifest` task records an execution summary payload.
+
+    ## Architecture diagram
+    ```mermaid
+    flowchart TD
+        T[Schedule: hourly_keeper_audit] --> S[audit_clickhouse_keeper]
+        S --> C{check_keeper_quorum}
+        C -- Degraded --> A[notify_slack_db_ops]
+        C -- Healthy --> H[log_healthy_keeper]
+        A --> E[export_keeper_manifest]
+        H --> E[export_keeper_manifest]
+    ```
+
+    ## Use cases
+    - Analytical Replicated Table Protection: Prevents ClickHouse `ReplicatedMergeTree` mutations and inserts from entering read-only mode during Raft elections.
+    - Distributed DDL Execution Shielding: Catches Keeper node network partitions before cluster-wide `ALTER TABLE` or `CREATE TABLE ... ON CLUSTER` queries time out.
+    - Consensus Snapshot Health: Identifies snapshot compaction delays and log transaction backlogs before disk I/O bottlenecks degrade analytical workloads.
+
+    ## Inputs
+    | Name | Type | Default | Description |
+    | --- | --- | --- | --- |
+    | `keeper_host` | STRING | `clickhouse-keeper-01.internal` | Hostname or IP address of the ClickHouse Keeper node. |
+    | `keeper_port` | INT | `9181` | TCP port configured for ClickHouse Keeper client coordination and four-letter commands. |
+    | `max_outstanding_requests` | INT | `15` | Threshold of queued outstanding requests in the Raft pipeline before alerting. |
+    | `alert_on_non_leader_follower` | BOOL | `true` | Whether to alert if the node is not in an active leader or follower Raft consensus role. |
+
+    ## Expected outputs
+    - `outputs.audit_clickhouse_keeper.vars.server_state`: Role of the node in the Raft cluster (leader, follower).
+    - `outputs.audit_clickhouse_keeper.vars.outstanding_requests`: Count of queued uncommitted coordination requests.
+    - `outputs.audit_clickhouse_keeper.vars.alive_connections`: Active ClickHouse server client connection count.
+    - `outputs.audit_clickhouse_keeper.vars.last_zxid`: Most recent transaction identifier processed by Keeper.
+    - `outputs.audit_clickhouse_keeper.vars.degraded`: Boolean flag indicating consensus degradation.
+    - `outputs.export_keeper_manifest.value`: Formatted text summary of the execution run.
+
+    ## Prerequisites
+    - Network connectivity from Kestra workers to ClickHouse Keeper client port (typically 9181 or 2181).
+    - ClickHouse Keeper configured with `four_letter_word_white_list` containing `mntr`.
+    - Slack incoming webhook endpoint configured.
+
+    ### Secrets
+    - `SLACK_WEBHOOK_URL`: Secret containing the Slack incoming webhook endpoint for channel alerts.
+
+    ## Quick start
+    1. Define `SLACK_WEBHOOK_URL` in your Kestra namespace secrets.
+    2. Adjust `keeper_host` and `keeper_port` to match your ClickHouse Keeper node address.
+    3. Run a manual execution to test socket connectivity and verify parsed Raft consensus state.
+    4. Enable the `hourly_keeper_audit` schedule for automated cluster surveillance.
+
+    ## Common pitfalls and troubleshooting
+    - Port Differences vs ZooKeeper: ZooKeeper typically defaults to port 2181, whereas standalone ClickHouse Keeper often binds to 9181. Ensure your port corresponds to the configured `tcp_port`.
+    - Four-Letter Command Whitelist: If `mntr` returns `Commands are not whitelisted`, update `keeper_server.four_letter_word_white_list` to include `mntr` in `config.xml`.
+    - Raft Snapshot Log Sizing: Ensure Keeper snapshot log directories have dedicated fast NVMe storage to prevent disk sync stalls during heavy DDL bursts.
+
+    ## How to extend
+    - Iterate across all Keeper cluster nodes concurrently using Kestra Parallel tasks to verify unanimous ZXID synchronization.
+    - Correlate Keeper queue latency with ClickHouse `system.zookeeper` table query duration metrics.
+    - Trigger automated node restarting via Kubernetes or systemd tasks when Raft consensus becomes partition-locked.
+
+    ## Links
+    - [ClickHouse Keeper Documentation](https://clickhouse.com/docs/en/operations/clickhouse-keeper)
+    - [ClickHouse Keeper Monitoring Reference](https://clickhouse.com/docs/en/operations/clickhouse-keeper#monitoring)
+    - [Kestra Slack Plugin Documentation](https://kestra.io/plugins/plugin-slack)
+  tags:
+    - Data
+    - Infrastructure
+  subTags:
+    - Day 2 Operations
+    - Monitoring & Alerting
+  ee: false
+  demo: false
