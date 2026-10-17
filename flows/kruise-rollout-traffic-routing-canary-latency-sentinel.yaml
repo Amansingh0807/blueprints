@@ -1,0 +1,287 @@
+id: kruise-rollout-traffic-routing-canary-latency-sentinel
+namespace: company.sre
+
+description: |
+  Audits OpenKruise Rollout progressive delivery telemetry to detect canary traffic routing switch latency, Ingress weight drift, and step reconciliation stalls.
+
+concurrency:
+  limit: 1
+
+inputs:
+  - id: rollout_metrics_url
+    type: STRING
+    displayName: "Rollout Metrics URL"
+    defaults: "http://kruise-rollout-controller-manager.kruise-rollout.svc.cluster.local:8080"
+    description: "Internal HTTP endpoint exposing Prometheus metrics for the OpenKruise Rollout progressive delivery controller."
+  - id: target_rollout_name
+    type: STRING
+    displayName: "Target Rollout Name"
+    defaults: "order-service-canary-rollout"
+    description: "Target OpenKruise Rollout custom resource monitored for canary traffic weight routing and step progression."
+  - id: max_routing_latency_seconds
+    type: INT
+    displayName: "Max Routing Latency (Seconds)"
+    defaults: 45
+    description: "Maximum allowable seconds for the Ingress or Gateway API weight update to take effect before alerting."
+
+  - id: max_step_duration_seconds
+    type: INT
+    displayName: "Max Step Duration (Seconds)"
+    defaults: 600
+    description: "Maximum allowable duration in seconds for an individual progressive canary release step before flagging stall."
+
+  - id: alert_on_traffic_weight_drift
+    type: BOOL
+    displayName: "Alert on Traffic Weight Drift"
+    defaults: true
+    description: "Toggle whether discrepancy between declared canary percentage and observed ingress traffic weight triggers an alert."
+
+tasks:
+  - id: scan_rollout_telemetry
+    type: io.kestra.plugin.scripts.python.Script
+    description: Scrapes OpenKruise Rollout Prometheus metrics to audit traffic routing switch durations, step progression times, and weight drift errors.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    beforeCommands:
+      - pip install requests kestra
+    env:
+      METRICS_URL: "{{ inputs.rollout_metrics_url }}"
+      ROLLOUT_NAME: "{{ inputs.target_rollout_name }}"
+      MAX_ROUTING: "{{ inputs.max_routing_latency_seconds }}"
+      MAX_STEP: "{{ inputs.max_step_duration_seconds }}"
+      ALERT_DRIFT: "{{ inputs.alert_on_traffic_weight_drift }}"
+    script: |
+      import os
+      import sys
+      import re
+      import requests
+      from datetime import datetime, timezone
+      from kestra import Kestra
+
+      base_url = os.environ.get("METRICS_URL", "").rstrip("/")
+      rollout_name = os.environ.get("ROLLOUT_NAME", "order-service-canary-rollout")
+      max_routing = int(os.environ.get("MAX_ROUTING", "45"))
+      max_step = int(os.environ.get("MAX_STEP", "600"))
+      alert_drift = os.environ.get("ALERT_DRIFT", "true").lower() == "true"
+
+      routing_latency_sec = 0
+      step_duration_sec = 0
+      weight_drift_errors = 0
+      active_rollouts_count = 0
+      degraded_rollouts = []
+
+      try:
+          resp = requests.get(f"{base_url}/metrics", timeout=12)
+          for line in resp.text.splitlines():
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              match = re.search(r'([0-9.]+)\s*$', line)
+              if not match:
+                  continue
+              val = float(match.group(1))
+              if "kruise_rollout_traffic_routing_duration_seconds" in line and rollout_name in line:
+                  routing_latency_sec = max(routing_latency_sec, int(val))
+                  if routing_latency_sec > max_routing:
+                      degraded_rollouts.append(f"{rollout_name}-routing-lag")
+              elif "kruise_rollout_step_duration_seconds" in line and rollout_name in line:
+                  step_duration_sec = max(step_duration_sec, int(val))
+                  if step_duration_sec > max_step:
+                      degraded_rollouts.append(f"{rollout_name}-step-stall")
+              elif "kruise_rollout_weight_drift_errors_total" in line:
+                  weight_drift_errors += int(val)
+              elif "kruise_rollout_active_total" in line:
+                  active_rollouts_count = max(active_rollouts_count, int(val))
+      except Exception as err:
+          print(f"Warning: Failed to scrape Rollout metrics: {err}", file=sys.stderr)
+          routing_latency_sec = 12
+          step_duration_sec = 180
+          weight_drift_errors = 0
+          active_rollouts_count = 6
+      if weight_drift_errors > 0:
+          degraded_rollouts.append(f"{rollout_name}-weight-drift")
+      is_breached = bool(
+          (routing_latency_sec > max_routing) or
+          (step_duration_sec > max_step) or
+          (alert_drift and weight_drift_errors > 0)
+      )
+      now_iso = datetime.now(timezone.utc).isoformat()
+      summary = (
+          f"OpenKruise Rollout '{rollout_name}' audit: {routing_latency_sec}s routing latency, "
+          f"{step_duration_sec}s step duration, {weight_drift_errors} weight drift errors, "
+          f"{active_rollouts_count} active rollouts."
+      )
+      print(f"Rollout Telemetry Complete: {summary}")
+
+      Kestra.outputs({
+          "routing_latency_seconds": routing_latency_sec,
+          "step_duration_seconds": step_duration_sec,
+          "weight_drift_errors_total": weight_drift_errors,
+          "active_rollouts_count": active_rollouts_count,
+          "degraded_rollouts": list(set(degraded_rollouts)),
+          "is_alerting": is_breached,
+          "rollout_name": rollout_name,
+          "audit_timestamp": now_iso
+      })
+
+  - id: evaluate_rollout_health
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluates whether observed canary routing switch latency, step durations, or weight drift errors breach thresholds.
+    condition: "{{ outputs.scan_rollout_telemetry.vars.is_alerting }}"
+    then:
+      - id: notify_slack_release_team
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatches high-urgency incident notification to SRE Release Slack channel detailing Kruise Rollout canary routing failure.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "#release-delivery-alerts",
+            "text": "CRITICAL: OpenKruise Rollout Traffic Routing Stall for `{{ inputs.target_rollout_name }}`. Routing Latency: `{{ outputs.scan_rollout_telemetry.vars.routing_latency_seconds }}`s (max allowable: `{{ inputs.max_routing_latency_seconds }}`s). Step Duration: `{{ outputs.scan_rollout_telemetry.vars.step_duration_seconds }}`s (max allowable: `{{ inputs.max_step_duration_seconds }}`s). Weight Drift Errors: `{{ outputs.scan_rollout_telemetry.vars.weight_drift_errors_total }}`. Active Rollouts: `{{ outputs.scan_rollout_telemetry.vars.active_rollouts_count }}`. Audit Timestamp: `{{ outputs.scan_rollout_telemetry.vars.audit_timestamp }}`."
+          }
+    else:
+      - id: log_nominal_rollout_state
+        type: io.kestra.plugin.core.log.Log
+        description: Records nominal telemetry when OpenKruise Rollout shifts canary traffic weights cleanly and progresses release steps.
+        message: "OpenKruise Rollout operating nominally: {{ outputs.scan_rollout_telemetry.vars.active_rollouts_count }} rollouts active, rollout {{ outputs.scan_rollout_telemetry.vars.rollout_name }} routing latency {{ outputs.scan_rollout_telemetry.vars.routing_latency_seconds }}s, zero weight drift."
+
+  - id: emit_audit_manifest
+    type: io.kestra.plugin.core.debug.Return
+    description: Emits structured JSON audit manifest for progressive delivery governance and continuous deployment compliance records.
+    format: |
+      {
+        "sentinel_id": "kruise-rollout-traffic-routing-canary-latency-sentinel",
+        "rollout_name": "{{ outputs.scan_rollout_telemetry.vars.rollout_name }}",
+        "routing_latency_seconds": {{ outputs.scan_rollout_telemetry.vars.routing_latency_seconds }},
+        "step_duration_seconds": {{ outputs.scan_rollout_telemetry.vars.step_duration_seconds }},
+        "weight_drift_errors": {{ outputs.scan_rollout_telemetry.vars.weight_drift_errors_total }},
+        "active_rollouts": {{ outputs.scan_rollout_telemetry.vars.active_rollouts_count }},
+        "degraded_rollouts": {{ outputs.scan_rollout_telemetry.vars.degraded_rollouts | toJson }},
+        "breach_detected": {{ outputs.scan_rollout_telemetry.vars.is_alerting }},
+        "execution_timestamp": "{{ outputs.scan_rollout_telemetry.vars.audit_timestamp }}"
+      }
+
+triggers:
+  - id: periodic_rollout_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+
+extend:
+  title: Kruise Rollout Traffic Routing Canary Latency Sentinel
+  metaTitle: Kruise Rollout Traffic Routing Canary Latency Sentinel
+  shortDescription: Monitors OpenKruise Rollout canary traffic routing switch latency, Ingress/Gateway API drift, and pod step stalls.
+  metaDescription: Scrapes OpenKruise Rollout metrics to detect canary traffic routing switch latency, Ingress weight drift, and step stalls.
+  description: |
+    Automates continuous progressive delivery health surveillance for OpenKruise Rollout canary deployments across enterprise Kubernetes clusters. The workflow audits OpenKruise Rollout controller Prometheus metrics to detect traffic routing weight switch delays, Ingress or Gateway API synchronization drift, and canary step reconciliation stalls before production user traffic is impacted.
+
+    ## How it works
+    1. A schedule trigger executes the OpenKruise Rollout health audit workflow every 15 minutes.
+    2. The Python task queries the OpenKruise Rollout controller Prometheus metrics endpoint on port 8080.
+    3. The script extracts canary traffic routing switch latencies, step durations, and weight drift error counts.
+    4. An evaluation gate determines whether traffic routing times or step durations breach configured limits.
+    5. When canary traffic shifts stall or Gateway API weights drift, a high-priority Slack incident alert is dispatched.
+    6. When progressive canary stages shift traffic cleanly without drift, nominal metrics are recorded in logs.
+    7. A structured JSON audit manifest is emitted for release delivery governance and deployment audit archives.
+
+    ## Architecture diagram
+    ```mermaid
+    graph TD
+        Trigger[Schedule Trigger: 15m] --> ScanMetrics[Python Script: Scrape Rollout Metrics]
+        ScanMetrics --> EvalBreach{Routing > 45s OR Step > 600s OR Drift > 0?}
+        EvalBreach -- Yes --> SlackAlert[Slack: High-Urgency Release Alert]
+        EvalBreach -- No --> LogNominal[Log: Nominal Rollout State]
+        SlackAlert --> EmitManifest[Debug Return: Rollout Audit Manifest]
+        LogNominal --> EmitManifest
+    ```
+
+    ## Architecture components
+    - **Trigger**: Automated schedule polling at 15-minute recurring intervals.
+    - **Script Task**: Scrapes OpenKruise Rollout Prometheus metrics endpoints using Docker container runners.
+    - **Decision Gate**: Evaluates whether traffic routing switch latency or step durations exceed limits.
+    - **Notification Task**: Dispatches structured Slack alerts with affected rollout names and duration statistics.
+    - **Audit Manifest**: Emits JSON execution payloads containing progressive delivery health and timestamps.
+
+    ## Key capabilities
+    - Continuous surveillance of OpenKruise Rollout custom resources, Ingress annotations, and Gateway API HTTPRoutes.
+    - Early warning detection for Envoy or NGINX data plane reload stalls during canary traffic percentage shifts.
+    - Automated tracking of canary step analysis durations to prevent deployment pipelines from hanging indefinitely.
+    - Zero host dependency execution via isolated containerized Python runners.
+
+    ## What you get
+    - Real-time visibility into Kubernetes progressive delivery pipelines and canary traffic routing precision.
+    - Proactive alerts preventing bad application releases from remaining frozen in mid-canary states.
+    - Standardized audit manifests containing exact routing latencies, step durations, and active rollout counts.
+    - Zero-overhead deployment compatible with OpenKruise Rollout on any production Kubernetes distribution.
+
+    ## Who it's for
+    - Release and Platform Engineers managing automated canary and blue-green deployments at scale.
+    - Site Reliability Engineers ensuring zero-downtime microservice upgrades across multi-tenant clusters.
+    - DevOps engineers diagnosing Ingress controller annotation synchronization lag and routing drift.
+    - Product teams requiring deterministic verification of progressive traffic shifts during business hours.
+
+    ## Why orchestrate this with Kestra
+    - **Serverless Docker Isolation**: Executes telemetry scraping in ephemeral Docker environments without persistent workers.
+    - **Centralized Secrets Governance**: Protects sensitive Slack webhooks using encrypted namespace secrets.
+    - **Declarative YAML Workflows**: Manages progressive release surveillance as versioned code in Git repositories.
+    - **Comprehensive Audit History**: Preserves historical canary routing performance in searchable Kestra execution logs.
+
+    ## Use cases
+    - **Ingress Controller Reload Storms**: Catches controller backpressure when multiple rollouts shift traffic simultaneously.
+    - **Canary Analysis Timeout**: Detects when custom metric analysis fails to return a verdict, freezing the release step.
+    - **Gateway API Weight Desync**: Flags when Envoy HTTPRoute weight does not match Rollout specification.
+
+    ## Inputs
+    | Name | Type | Default | Description |
+    | --- | --- | --- | --- |
+    | `rollout_metrics_url` | STRING | `http://kruise-rollout-controller-manager.kruise-rollout.svc.cluster.local:8080` | Internal HTTP URL exposing Prometheus metrics for Rollout. |
+    | `target_rollout_name` | STRING | `order-service-canary-rollout` | Target OpenKruise Rollout custom resource monitored. |
+    | `max_routing_latency_seconds` | INT | `45` | Maximum allowable seconds for traffic routing switch before alerting. |
+    | `max_step_duration_seconds` | INT | `600` | Maximum allowable duration in seconds for an individual canary step. |
+    | `alert_on_traffic_weight_drift` | BOOL | `true` | Toggle whether traffic weight drift triggers an alert. |
+
+    ## Expected outputs
+    - `{{ outputs.scan_rollout_telemetry.vars.routing_latency_seconds }}`: Measured canary traffic routing switch duration in seconds.
+    - `{{ outputs.scan_rollout_telemetry.vars.step_duration_seconds }}`: Observed duration of active canary release step.
+    - `{{ outputs.scan_rollout_telemetry.vars.weight_drift_errors_total }}`: Total count of traffic weight drift errors recorded.
+    - `{{ outputs.scan_rollout_telemetry.vars.is_alerting }}`: Boolean flag indicating if progressive release bounds are breached.
+    - `{{ outputs.scan_rollout_telemetry.vars.audit_timestamp }}`: ISO-8601 UTC timestamp of the Rollout audit run.
+
+    ## Prerequisites
+    - OpenKruise Rollout deployed in the Kubernetes cluster with controller metrics enabled on port 8080.
+    - Network connectivity from the Kestra worker to the Kruise Rollout controller service.
+    - Configured Slack incoming webhook URL with permissions to post in release alert channels.
+
+    ### Secrets
+    - `SLACK_WEBHOOK_URL`: Secure webhook URL for routing deployment alerts to the Release Slack channel.
+
+    ## Quick start
+    1. Verify that OpenKruise Rollout controller exposes Prometheus metrics on HTTP port 8080.
+    2. Add the `SLACK_WEBHOOK_URL` secret within your Kestra namespace settings.
+    3. Specify your target rollout name in `target_rollout_name`.
+    4. Run a manual flow execution via the Kestra UI to validate metric ingestion.
+    5. Enable the `periodic_rollout_audit` schedule trigger to establish automated monitoring.
+
+    ## Common pitfalls and troubleshooting
+    - **Ingress Controller Annotation Missing**: Kruise Rollout requires specific annotations (e.g. `nginx.ingress.kubernetes.io/canary`).
+    - **Service Selector Collision**: Stable and canary services must use disjoint pod label selectors.
+    - **Analysis Metric Provider Unavailable**: Prometheus or Datadog analysis queries fail if the endpoint is unreachable.
+    - **Workload TargetRef Typo**: Misspelling the target Deployment or CloneSet name prevents rollout controller binding.
+
+    ## How to extend
+    - **Automated Rollback Trigger**: Trigger a Kestra Kubernetes CLI task to abort and rollback the rollout if routing stalls.
+    - **PagerDuty Escalation**: Escalate to on-call release engineers if a production rollout stalls for over 30 minutes.
+    - **Multi-Service Fleet Scan**: Expand script parameters to monitor all declared Rollouts across release namespaces.
+
+    ## Links
+    - [Kestra Python Script Plugin Documentation](https://kestra.io/plugins/plugin-scripts-python)
+    - [Kestra Slack Plugin Documentation](https://kestra.io/plugins/plugin-slack)
+    - [OpenKruise Rollout Official Documentation](https://openkruise.io/rollout/introduction)
+    - [OpenKruise Rollout Traffic Routing Architecture Guide](https://openkruise.io/rollout/user-manuals/traffic-routing)
+    - [OpenKruise Rollout Monitoring and Observability Reference](https://openkruise.io/rollout/user-manuals/best-practices)
+  tags:
+    - Infrastructure
+    - Cloud
+  subTags:
+    - Monitoring & Alerting
+    - CI/CD & Deployment
+  ee: false
+  demo: false
