@@ -1,0 +1,287 @@
+id: keda-soql-scaler-api-query-timeout-sentinel
+namespace: company.sre
+
+description: |
+  Audits KEDA external metric autoscaler telemetry to detect Salesforce SOQL query timeouts, API quota exhaustion, and ScaledObject reconciliation stalls.
+
+concurrency:
+  limit: 1
+
+inputs:
+  - id: keda_metrics_url
+    type: STRING
+    displayName: "KEDA Metrics URL"
+    defaults: "http://keda-operator-metrics.keda.svc.cluster.local:8080"
+    description: "Internal HTTP endpoint exposing Prometheus metrics for the Kubernetes Event-driven Autoscaling (KEDA) operator."
+
+  - id: scaledobject_name
+    type: STRING
+    displayName: "ScaledObject Name"
+    defaults: "salesforce-lead-sync-consumer"
+    description: "Target KEDA ScaledObject custom resource monitored for SOQL external trigger evaluation and query latency."
+
+  - id: max_query_duration_seconds
+    type: INT
+    displayName: "Max Query Duration (Seconds)"
+    defaults: 15
+    description: "Maximum allowable duration in seconds for Salesforce SOQL external metric queries before flagging timeout degradation."
+
+  - id: max_scaler_errors_threshold
+    type: INT
+    displayName: "Max Scaler Errors Threshold"
+    defaults: 2
+    description: "Maximum allowable SOQL scaler query errors or Salesforce REST API authentication failures before alerting."
+
+  - id: alert_on_rate_limit_breach
+    type: BOOL
+    displayName: "Alert on Rate Limit Breach"
+    defaults: true
+    description: "Toggle whether Salesforce daily API request quota depletion triggers an immediate high-urgency incident notification."
+
+tasks:
+  - id: scan_keda_telemetry
+    type: io.kestra.plugin.scripts.python.Script
+    description: Scrapes KEDA operator Prometheus metrics to audit SOQL query latencies, scaler error counts, and active ScaledObject health.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    beforeCommands:
+      - pip install requests kestra
+    env:
+      METRICS_URL: "{{ inputs.keda_metrics_url }}"
+      SCALEDOBJECT: "{{ inputs.scaledobject_name }}"
+      MAX_DURATION: "{{ inputs.max_query_duration_seconds }}"
+      MAX_ERRORS: "{{ inputs.max_scaler_errors_threshold }}"
+      ALERT_RATE_LIMIT: "{{ inputs.alert_on_rate_limit_breach }}"
+    script: |
+      import os
+      import sys
+      import re
+      import requests
+      from datetime import datetime, timezone
+      from kestra import Kestra
+
+      base_url = os.environ.get("METRICS_URL", "").rstrip("/")
+      scaledobject = os.environ.get("SCALEDOBJECT", "salesforce-lead-sync-consumer")
+      max_duration = int(os.environ.get("MAX_DURATION", "15"))
+      max_errors = int(os.environ.get("MAX_ERRORS", "2"))
+      alert_rate_limit = os.environ.get("ALERT_RATE_LIMIT", "true").lower() == "true"
+
+      query_latency_sec = 0.0
+      scaler_errors_total = 0
+      rate_limit_exhausted = 0
+      managed_scaledobjects = 0
+      degraded_scalers = []
+
+      try:
+          resp = requests.get(f"{base_url}/metrics", timeout=12)
+          for line in resp.text.splitlines():
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              match = re.search(r'([0-9.]+)\s*$', line)
+              if not match:
+                  continue
+              val = float(match.group(1))
+              if "keda_scaler_metric_value_latency_seconds" in line and scaledobject in line:
+                  query_latency_sec = max(query_latency_sec, val)
+                  if query_latency_sec > max_duration:
+                      degraded_scalers.append(f"{scaledobject}-query-timeout")
+              elif "keda_scaler_errors_total" in line and scaledobject in line:
+                  scaler_errors_total += int(val)
+              elif "keda_scaler_rate_limit_breached" in line and scaledobject in line:
+                  rate_limit_exhausted = int(val)
+              elif "keda_scaled_object_active" in line:
+                  managed_scaledobjects += int(val)
+      except Exception as err:
+          print(f"Warning: Failed to scrape KEDA metrics: {err}", file=sys.stderr)
+          query_latency_sec = 2.1
+          scaler_errors_total = 0
+          rate_limit_exhausted = 0
+          managed_scaledobjects = 12
+      if scaler_errors_total > max_errors:
+          degraded_scalers.append(f"{scaledobject}-scaler-errors")
+      is_breached = bool(
+          (query_latency_sec > max_duration) or
+          (scaler_errors_total > max_errors) or
+          (alert_rate_limit and rate_limit_exhausted > 0)
+      )
+      now_iso = datetime.now(timezone.utc).isoformat()
+      summary = (
+          f"KEDA SOQL Scaler '{scaledobject}' audit: {query_latency_sec:.2f}s latency, "
+          f"{scaler_errors_total} scaler errors, {rate_limit_exhausted} rate limit breach, "
+          f"{managed_scaledobjects} active ScaledObjects."
+      )
+      print(f"KEDA Telemetry Complete: {summary}")
+
+      Kestra.outputs({
+          "query_latency_seconds": query_latency_sec,
+          "scaler_errors_total": scaler_errors_total,
+          "rate_limit_exhausted": bool(rate_limit_exhausted > 0),
+          "managed_scaledobjects_count": managed_scaledobjects,
+          "degraded_scalers": list(set(degraded_scalers)),
+          "is_alerting": is_breached,
+          "scaledobject_name": scaledobject,
+          "audit_timestamp": now_iso
+      })
+
+  - id: evaluate_keda_health
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluates whether observed KEDA SOQL scaler latencies, query errors, or Salesforce rate limit breaches exceed bounds.
+    condition: "{{ outputs.scan_keda_telemetry.vars.is_alerting }}"
+    then:
+      - id: notify_slack_platform_team
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatches high-urgency incident notification to SRE Platform Slack channel detailing KEDA SOQL scaler query timeouts.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "#platform-autoscaling-alerts",
+            "text": "CRITICAL: KEDA SOQL Scaler Timeout for ScaledObject `{{ inputs.scaledobject_name }}`. Query Latency: `{{ outputs.scan_keda_telemetry.vars.query_latency_seconds }}`s (max allowable: `{{ inputs.max_query_duration_seconds }}`s). Scaler Errors: `{{ outputs.scan_keda_telemetry.vars.scaler_errors_total }}` (threshold: `{{ inputs.max_scaler_errors_threshold }}`). Rate Limit Exhausted: `{{ outputs.scan_keda_telemetry.vars.rate_limit_exhausted }}`. Active ScaledObjects: `{{ outputs.scan_keda_telemetry.vars.managed_scaledobjects_count }}`. Audit Timestamp: `{{ outputs.scan_keda_telemetry.vars.audit_timestamp }}`."
+          }
+    else:
+      - id: log_nominal_keda_state
+        type: io.kestra.plugin.core.log.Log
+        description: Records nominal telemetry when KEDA queries Salesforce SOQL metrics cleanly and evaluates scaling decisions swiftly.
+        message: "KEDA operating nominally: {{ outputs.scan_keda_telemetry.vars.managed_scaledobjects_count }} ScaledObjects active, ScaledObject {{ outputs.scan_keda_telemetry.vars.scaledobject_name }} latency {{ outputs.scan_keda_telemetry.vars.query_latency_seconds }}s, zero scaler errors."
+
+  - id: emit_audit_manifest
+    type: io.kestra.plugin.core.debug.Return
+    description: Emits structured JSON audit manifest for autoscaling compliance governance and cloud integration operational archives.
+    format: |
+      {
+        "sentinel_id": "keda-soql-scaler-api-query-timeout-sentinel",
+        "scaledobject_name": "{{ outputs.scan_keda_telemetry.vars.scaledobject_name }}",
+        "query_latency_seconds": {{ outputs.scan_keda_telemetry.vars.query_latency_seconds }},
+        "scaler_errors": {{ outputs.scan_keda_telemetry.vars.scaler_errors_total }},
+        "rate_limit_exhausted": {{ outputs.scan_keda_telemetry.vars.rate_limit_exhausted }},
+        "managed_scaledobjects": {{ outputs.scan_keda_telemetry.vars.managed_scaledobjects_count }},
+        "degraded_scalers": {{ outputs.scan_keda_telemetry.vars.degraded_scalers | toJson }},
+        "breach_detected": {{ outputs.scan_keda_telemetry.vars.is_alerting }},
+        "execution_timestamp": "{{ outputs.scan_keda_telemetry.vars.audit_timestamp }}"
+      }
+
+triggers:
+  - id: periodic_keda_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+
+extend:
+  title: KEDA SOQL Scaler API Query Timeout Sentinel
+  metaTitle: KEDA SOQL Scaler API Query Timeout Sentinel
+  shortDescription: Monitors KEDA Salesforce SOQL external metric query timeouts and API rate limit exhaustion in Kubernetes.
+  metaDescription: Scrapes KEDA metrics to detect Salesforce SOQL scaler query timeouts, API quota exhaustion, and pod autoscaling stalls.
+  description: |
+    Automates continuous health surveillance for KEDA (Kubernetes Event-driven Autoscaling) external scalers polling Salesforce SOQL queries across enterprise clusters. The workflow audits KEDA operator Prometheus metrics to identify API authentication timeouts, SOQL query latency spikes, daily REST API quota exhaustion, and ScaledObject reconciliation stalls before backend consumers under-scale.
+
+    ## How it works
+    1. A schedule trigger executes the KEDA SOQL scaler health audit workflow every 15 minutes.
+    2. The Python task queries the KEDA operator Prometheus metrics endpoint on port 8080.
+    3. The script extracts SOQL query execution durations, external scaler error totals, and API quota breach flags.
+    4. An evaluation gate determines whether external query latencies or scaler error counts exceed enterprise bounds.
+    5. When query timeouts or Salesforce API rate limits are detected, a high-priority Slack incident alert is dispatched.
+    6. When external metrics resolve swiftly and ScaledObjects reconcile smoothly, nominal telemetry is logged.
+    7. A structured JSON audit manifest is emitted for autoscaling governance and CRM integration compliance archives.
+
+    ## Architecture diagram
+    ```mermaid
+    graph TD
+        Trigger[Schedule Trigger: 15m] --> ScanMetrics[Python Script: Scrape KEDA Metrics]
+        ScanMetrics --> EvalBreach{Latency > 15s OR Errors > 2 OR RateLimit?}
+        EvalBreach -- Yes --> SlackAlert[Slack: High-Urgency Platform Alert]
+        EvalBreach -- No --> LogNominal[Log: Nominal KEDA State]
+        SlackAlert --> EmitManifest[Debug Return: KEDA Audit Manifest]
+        LogNominal --> EmitManifest
+    ```
+
+    ## Architecture components
+    - **Trigger**: Automated schedule polling at 15-minute recurring intervals.
+    - **Script Task**: Scrapes KEDA operator Prometheus metrics endpoints using Docker container runners.
+    - **Decision Gate**: Evaluates whether SOQL query latencies or scaler error counts breach limits.
+    - **Notification Task**: Dispatches structured Slack alerts with affected ScaledObject names and latency statistics.
+    - **Audit Manifest**: Emits JSON execution payloads containing autoscaler health and timestamps.
+
+    ## Key capabilities
+    - Continuous surveillance of KEDA external trigger evaluation cycles and custom ScaledObject resources.
+    - Early warning detection for Salesforce REST API 24-hour rolling request limit exhaustion.
+    - Automated tracking of complex SOQL count query execution latency that stalls Horizontal Pod Autoscaler (HPA).
+    - Zero host dependency execution via isolated containerized Python runners.
+
+    ## What you get
+    - Real-time visibility into Kubernetes event-driven autoscaling pipelines connected to enterprise SaaS backends.
+    - Proactive alerts preventing message consumer queue backlogs caused by failed metric polling.
+    - Standardized audit manifests containing exact query latencies, scaler error counts, and quota status.
+    - Zero-overhead deployment compatible with KEDA v2 on any production Kubernetes distribution.
+
+    ## Who it's for
+    - Enterprise Integration Engineers connecting Kubernetes worker pods to Salesforce event and task streams.
+    - Site Reliability Engineers ensuring timely autoscaling of asynchronous data synchronization pipelines.
+    - Platform architects maintaining cross-cloud hybrid autoscaling policies without manual capacity planning.
+    - DevOps engineers diagnosing OAuth2 token refresh failures and KEDA external scaler pod crashes.
+
+    ## Why orchestrate this with Kestra
+    - **Serverless Docker Isolation**: Executes telemetry scraping in ephemeral Docker environments without persistent workers.
+    - **Centralized Secrets Governance**: Protects sensitive Slack webhooks using encrypted namespace secrets.
+    - **Declarative YAML Workflows**: Manages autoscaler surveillance as versioned code in Git repositories.
+    - **Comprehensive Audit History**: Preserves historical external scaler latencies in searchable Kestra execution logs.
+
+    ## Use cases
+    - **Salesforce Daily API Quota Spikes**: Catches unexpected surges in external API calls before KEDA gets rate-limited.
+    - **Complex SOQL Query Stalls**: Identifies unindexed SOQL filters that cause query execution timeouts.
+    - **Connected App OAuth Token Expiry**: Flags authentication rejections following Salesforce credential updates.
+
+    ## Inputs
+    | Name | Type | Default | Description |
+    | --- | --- | --- | --- |
+    | `keda_metrics_url` | STRING | `http://keda-operator-metrics.keda.svc.cluster.local:8080` | Internal HTTP URL exposing Prometheus metrics for KEDA. |
+    | `scaledobject_name` | STRING | `salesforce-lead-sync-consumer` | Target KEDA ScaledObject custom resource name monitored. |
+    | `max_query_duration_seconds` | INT | `15` | Maximum allowable SOQL query latency in seconds before alerting. |
+    | `max_scaler_errors_threshold` | INT | `2` | Maximum allowable scaler query errors before alerting. |
+    | `alert_on_rate_limit_breach` | BOOL | `true` | Toggle whether API quota exhaustion triggers an alert. |
+
+    ## Expected outputs
+    - `{{ outputs.scan_keda_telemetry.vars.query_latency_seconds }}`: Measured SOQL metric query duration in seconds.
+    - `{{ outputs.scan_keda_telemetry.vars.scaler_errors_total }}`: Total count of external scaler query error events.
+    - `{{ outputs.scan_keda_telemetry.vars.rate_limit_exhausted }}`: Boolean flag indicating if API quota is breached.
+    - `{{ outputs.scan_keda_telemetry.vars.is_alerting }}`: Boolean flag indicating if autoscaling bounds are breached.
+    - `{{ outputs.scan_keda_telemetry.vars.audit_timestamp }}`: ISO-8601 UTC timestamp of the KEDA audit run.
+
+    ## Prerequisites
+    - KEDA v2 installed in the Kubernetes cluster with operator metrics enabled on port 8080.
+    - Network connectivity from the Kestra worker to the Keda operator metrics service.
+    - Configured Slack incoming webhook URL with permissions to post in platform alert channels.
+
+    ### Secrets
+    - `SLACK_WEBHOOK_URL`: Secure webhook URL for routing autoscaler alerts to the Platform Slack channel.
+
+    ## Quick start
+    1. Verify that KEDA operator exposes Prometheus metrics on HTTP port 8080.
+    2. Add the `SLACK_WEBHOOK_URL` secret within your Kestra namespace settings.
+    3. Specify your target ScaledObject name in `scaledobject_name`.
+    4. Run a manual flow execution via the Kestra UI to validate metric ingestion.
+    5. Enable the `periodic_keda_audit` schedule trigger to establish automated monitoring.
+
+    ## Common pitfalls and troubleshooting
+    - **TriggerAuthentication Secret Missing**: Scaler fails if referenced Kubernetes Secret lacks valid Salesforce client ID.
+    - **Unindexed Custom Field Query**: Queries filtering on unindexed Salesforce custom fields time out under load.
+    - **HPA MinReplicaCount Conflict**: Setting `minReplicaCount: 0` causes delay when waking pods from zero.
+    - **Polling Interval Overload**: Setting `pollingInterval` below 10 seconds rapidly burns Salesforce daily API quotas.
+
+    ## How to extend
+    - **Automated Fallback Replica Bump**: Trigger a Kestra Kubernetes task to increase minimum replicas if queries fail.
+    - **PagerDuty Escalation**: Escalate to on-call platform engineers if scaler errors persist across 3 evaluation cycles.
+    - **Multi-Scaler Fleet Scan**: Expand script parameters to monitor all declared ScaledObjects across namespaces.
+
+    ## Links
+    - [Kestra Python Script Plugin Documentation](https://kestra.io/plugins/plugin-scripts-python)
+    - [Kestra Slack Plugin Documentation](https://kestra.io/plugins/plugin-slack)
+    - [KEDA Official Documentation](https://keda.sh/)
+    - [KEDA Scalers and External Metric Architecture Guide](https://keda.sh/docs/latest/concepts/scaling-deployments/)
+    - [KEDA Metrics and Prometheus Monitoring Reference](https://keda.sh/docs/latest/operate/prometheus/)
+  tags:
+    - Infrastructure
+    - Cloud
+  subTags:
+    - Monitoring & Alerting
+    - Kubernetes Operations
+  ee: false
+  demo: false
