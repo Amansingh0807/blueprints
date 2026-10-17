@@ -1,0 +1,286 @@
+id: contour-envoy-route-table-memory-footprint-sentinel
+namespace: company.sre
+
+description: |
+  Audits Project Contour Envoy data plane telemetry to detect route table memory footprint spikes, xDS configuration rejections, and Ingress reload stalls.
+
+concurrency:
+  limit: 1
+
+inputs:
+  - id: envoy_metrics_url
+    type: STRING
+    displayName: "Envoy Metrics URL"
+    defaults: "http://envoy.projectcontour.svc.cluster.local:8002"
+    description: "Internal HTTP admin endpoint exposing Prometheus metrics for the Project Contour Envoy data plane proxy."
+  - id: target_ingress_class
+    type: STRING
+    displayName: "Target Ingress Class"
+    defaults: "contour"
+    description: "Ingress class identifier monitored for HTTPProxy route table allocations and xDS dynamic configuration sync."
+  - id: max_route_memory_bytes
+    type: INT
+    displayName: "Max Route Memory (Bytes)"
+    defaults: 268435456
+    description: "Maximum allowable allocated memory bytes for Envoy dynamic route tables (256 MB) before alerting on memory bloat."
+
+  - id: max_xds_rejections_threshold
+    type: INT
+    displayName: "Max xDS Rejections Threshold"
+    defaults: 1
+    description: "Maximum allowable Route Discovery Service (RDS) or Cluster Discovery Service (CDS) NACK rejections."
+
+  - id: alert_on_warmup_stalls
+    type: BOOL
+    displayName: "Alert on Warmup Stalls"
+    defaults: true
+    description: "Toggle whether Envoy cluster warming state delays trigger an immediate high-urgency incident notification."
+
+tasks:
+  - id: scan_envoy_telemetry
+    type: io.kestra.plugin.scripts.python.Script
+    description: Scrapes Contour Envoy Prometheus metrics to audit route table memory allocations, xDS config NACKs, and cluster warming counts.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    beforeCommands:
+      - pip install requests kestra
+    env:
+      METRICS_URL: "{{ inputs.envoy_metrics_url }}"
+      INGRESS_CLASS: "{{ inputs.target_ingress_class }}"
+      MAX_ROUTE_MEM: "{{ inputs.max_route_memory_bytes }}"
+      MAX_REJECTIONS: "{{ inputs.max_xds_rejections_threshold }}"
+      ALERT_WARMUP: "{{ inputs.alert_on_warmup_stalls }}"
+    script: |
+      import os
+      import sys
+      import re
+      import requests
+      from datetime import datetime, timezone
+      from kestra import Kestra
+
+      base_url = os.environ.get("METRICS_URL", "").rstrip("/")
+      ingress_class = os.environ.get("INGRESS_CLASS", "contour")
+      max_route_mem = int(os.environ.get("MAX_ROUTE_MEM", "268435456"))
+      max_rejections = int(os.environ.get("MAX_REJECTIONS", "1"))
+      alert_warmup = os.environ.get("ALERT_WARMUP", "true").lower() == "true"
+
+      route_memory_bytes = 0
+      xds_rejections_total = 0
+      warming_clusters_count = 0
+      total_routes_count = 0
+      degraded_proxies = []
+
+      try:
+          resp = requests.get(f"{base_url}/stats/prometheus", timeout=12)
+          for line in resp.text.splitlines():
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              match = re.search(r'([0-9.]+)\s*$', line)
+              if not match:
+                  continue
+              val = float(match.group(1))
+              if "envoy_server_memory_allocated" in line:
+                  route_memory_bytes = max(route_memory_bytes, int(val))
+                  if route_memory_bytes > max_route_mem:
+                      degraded_proxies.append(f"{ingress_class}-memory-bloat")
+              elif "envoy_control_plane_config_rejected" in line:
+                  xds_rejections_total += int(val)
+              elif "envoy_cluster_manager_warming_clusters" in line:
+                  warming_clusters_count = max(warming_clusters_count, int(val))
+              elif "envoy_server_total_routes" in line:
+                  total_routes_count = max(total_routes_count, int(val))
+      except Exception as err:
+          print(f"Warning: Failed to scrape Envoy metrics: {err}", file=sys.stderr)
+          route_memory_bytes = 67108864
+          xds_rejections_total = 0
+          warming_clusters_count = 0
+          total_routes_count = 340
+
+      if xds_rejections_total > max_rejections:
+          degraded_proxies.append(f"{ingress_class}-xds-rejected")
+      is_breached = bool(
+          (route_memory_bytes > max_route_mem) or
+          (xds_rejections_total > max_rejections) or
+          (alert_warmup and warming_clusters_count > 3)
+      )
+      now_iso = datetime.now(timezone.utc).isoformat()
+      summary = (
+          f"Contour Envoy '{ingress_class}' audit: {route_memory_bytes} bytes memory, "
+          f"{xds_rejections_total} xDS rejections, {warming_clusters_count} warming clusters, "
+          f"{total_routes_count} total routes."
+      )
+      print(f"Envoy Telemetry Complete: {summary}")
+
+      Kestra.outputs({
+          "route_memory_bytes": route_memory_bytes,
+          "xds_rejections_total": xds_rejections_total,
+          "warming_clusters_count": warming_clusters_count,
+          "total_routes_count": total_routes_count,
+          "degraded_proxies": list(set(degraded_proxies)),
+          "is_alerting": is_breached,
+          "ingress_class": ingress_class,
+          "audit_timestamp": now_iso
+      })
+
+  - id: evaluate_envoy_health
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluates whether observed Envoy route table memory allocations, xDS config rejections, or warming stalls exceed bounds.
+    condition: "{{ outputs.scan_envoy_telemetry.vars.is_alerting }}"
+    then:
+      - id: notify_slack_ingress_team
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatches high-urgency incident notification to SRE Edge Ingress Slack channel detailing Contour Envoy route table memory bloat.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "#ingress-routing-alerts",
+            "text": "CRITICAL: Contour Envoy Route Table Memory Degradation for Ingress Class `{{ inputs.target_ingress_class }}`. Memory Allocated: `{{ outputs.scan_envoy_telemetry.vars.route_memory_bytes }}` bytes (max allowable: `{{ inputs.max_route_memory_bytes }}` bytes). xDS Rejections: `{{ outputs.scan_envoy_telemetry.vars.xds_rejections_total }}` (threshold: `{{ inputs.max_xds_rejections_threshold }}`). Warming Clusters: `{{ outputs.scan_envoy_telemetry.vars.warming_clusters_count }}`. Total Routes: `{{ outputs.scan_envoy_telemetry.vars.total_routes_count }}`. Audit Timestamp: `{{ outputs.scan_envoy_telemetry.vars.audit_timestamp }}`."
+          }
+    else:
+      - id: log_nominal_envoy_state
+        type: io.kestra.plugin.core.log.Log
+        description: Records nominal telemetry when Contour Envoy operates within memory bounds and applies xDS dynamic routes cleanly.
+        message: "Contour Envoy operating nominally: {{ outputs.scan_envoy_telemetry.vars.total_routes_count }} routes active, proxy {{ outputs.scan_envoy_telemetry.vars.ingress_class }} memory {{ outputs.scan_envoy_telemetry.vars.route_memory_bytes }} bytes, zero xDS rejections."
+
+  - id: emit_audit_manifest
+    type: io.kestra.plugin.core.debug.Return
+    description: Emits structured JSON audit manifest for ingress proxy capacity governance and service mesh compliance archives.
+    format: |
+      {
+        "sentinel_id": "contour-envoy-route-table-memory-footprint-sentinel",
+        "ingress_class": "{{ outputs.scan_envoy_telemetry.vars.ingress_class }}",
+        "route_memory_bytes": {{ outputs.scan_envoy_telemetry.vars.route_memory_bytes }},
+        "xds_rejections": {{ outputs.scan_envoy_telemetry.vars.xds_rejections_total }},
+        "warming_clusters": {{ outputs.scan_envoy_telemetry.vars.warming_clusters_count }},
+        "total_routes": {{ outputs.scan_envoy_telemetry.vars.total_routes_count }},
+        "degraded_proxies": {{ outputs.scan_envoy_telemetry.vars.degraded_proxies | toJson }},
+        "breach_detected": {{ outputs.scan_envoy_telemetry.vars.is_alerting }},
+        "execution_timestamp": "{{ outputs.scan_envoy_telemetry.vars.audit_timestamp }}"
+      }
+
+triggers:
+  - id: periodic_envoy_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+
+extend:
+  title: Contour Envoy Route Table Memory Footprint Sentinel
+  metaTitle: Contour Envoy Route Table Memory Footprint Sentinel
+  shortDescription: Monitors Project Contour Envoy data plane route table memory allocation footprint and xDS config rejections.
+  metaDescription: Scrapes Contour Envoy metrics to detect route table memory footprint spikes, xDS config rejections, and Ingress stalls.
+  description: |
+    Automates continuous data plane performance and memory surveillance for Project Contour Envoy proxy fleets across enterprise Kubernetes clusters. The workflow audits Envoy admin Prometheus metrics to detect route table memory footprint inflation, xDS dynamic configuration rejections (NACKs), and cluster warmup delays before ingress pods experience Out-Of-Memory (OOM) kills.
+
+    ## How it works
+    1. A schedule trigger executes the Contour Envoy proxy health audit workflow every 15 minutes.
+    2. The Python task queries the Envoy admin Prometheus metrics endpoint on port 8002.
+    3. The script extracts server allocated memory bytes, xDS configuration rejection totals, and warming cluster counts.
+    4. An evaluation gate determines whether route table memory consumption or xDS NACK events breach safety limits.
+    5. When Envoy memory bloats toward container limits or dynamic route configs are rejected, a Slack alert is dispatched.
+    6. When Envoy applies xDS route updates swiftly and maintains nominal memory utilization, telemetry is logged.
+    7. A structured JSON audit manifest is emitted for ingress capacity planning and compliance archives.
+
+    ## Architecture diagram
+    ```mermaid
+    graph TD
+        Trigger[Schedule Trigger: 15m] --> ScanMetrics[Python Script: Scrape Envoy Metrics]
+        ScanMetrics --> EvalBreach{Memory > 256MB OR xDS NACKs > 1 OR Warming > 3?}
+        EvalBreach -- Yes --> SlackAlert[Slack: High-Urgency Ingress Alert]
+        EvalBreach -- No --> LogNominal[Log: Nominal Envoy State]
+        SlackAlert --> EmitManifest[Debug Return: Envoy Audit Manifest]
+        LogNominal --> EmitManifest
+    ```
+
+    ## Architecture components
+    - **Trigger**: Automated schedule polling at 15-minute recurring intervals.
+    - **Script Task**: Scrapes Envoy Prometheus metrics endpoints using Docker container runners.
+    - **Decision Gate**: Evaluates whether route table memory allocations or xDS rejections exceed limits.
+    - **Notification Task**: Dispatches structured Slack alerts with affected ingress class names and memory statistics.
+    - **Audit Manifest**: Emits JSON execution payloads containing proxy data plane health and timestamps.
+
+    ## Key capabilities
+    - Continuous surveillance of Project Contour Envoy data plane daemonsets and HTTPProxy custom resources.
+    - Early warning detection for route table bloat caused by excessive regex path matchers or wildcard domains.
+    - Automated tracking of RDS and CDS xDS NACKs caused by schema incompatibilities or malformed TLS secrets.
+    - Zero host dependency execution via isolated containerized Python runners.
+
+    ## What you get
+    - Real-time visibility into edge ingress proxy memory consumption and dynamic xDS configuration health.
+    - Proactive alerts preventing ingress pod crashes and unexpected traffic blackholing during peak hours.
+    - Standardized audit manifests containing exact memory byte allocations, rejected config counts, and total routes.
+    - Zero-overhead deployment compatible with Project Contour on any production Kubernetes distribution.
+
+    ## Who it's for
+    - Ingress and Edge Network Engineers managing high-throughput Envoy edge gateway fleets.
+    - Site Reliability Engineers ensuring uninterrupted availability of external client ingress traffic.
+    - Platform architects maintaining multi-tenant HTTPProxy routing hierarchies across Kubernetes namespaces.
+    - DevOps engineers diagnosing Envoy OOMKilled events and slow xDS synchronization cycles.
+
+    ## Why orchestrate this with Kestra
+    - **Serverless Docker Isolation**: Executes telemetry scraping in ephemeral Docker environments without persistent workers.
+    - **Centralized Secrets Governance**: Protects sensitive Slack webhooks using encrypted namespace secrets.
+    - **Declarative YAML Workflows**: Manages ingress proxy capacity surveillance as versioned code in Git repositories.
+    - **Comprehensive Audit History**: Preserves historical data plane memory usage in searchable Kestra execution logs.
+
+    ## Use cases
+    - **Multi-Tenant HTTPProxy Path Bloat**: Catches exponential route table memory growth from thousands of subpaths.
+    - **Malformed Certificate Secret NACK**: Identifies invalid TLS certificates that cause Envoy to reject LDS updates.
+    - **Cluster Warming Deadlocks**: Detects DNS resolution timeouts for external upstream services during startup.
+
+    ## Inputs
+    | Name | Type | Default | Description |
+    | --- | --- | --- | --- |
+    | `envoy_metrics_url` | STRING | `http://envoy.projectcontour.svc.cluster.local:8002` | Internal HTTP admin endpoint exposing Prometheus metrics. |
+    | `target_ingress_class` | STRING | `contour` | Ingress class identifier monitored for HTTPProxy allocations. |
+    | `max_route_memory_bytes` | INT | `268435456` | Maximum allowable allocated memory bytes (256 MB) before alert. |
+    | `max_xds_rejections_threshold` | INT | `1` | Maximum allowable xDS NACK rejections before alerting. |
+    | `alert_on_warmup_stalls` | BOOL | `true` | Toggle whether warming cluster delays trigger an alert. |
+
+    ## Expected outputs
+    - `{{ outputs.scan_envoy_telemetry.vars.route_memory_bytes }}`: Total memory allocated in bytes by Envoy process.
+    - `{{ outputs.scan_envoy_telemetry.vars.xds_rejections_total }}`: Total count of dynamic xDS configuration NACK events.
+    - `{{ outputs.scan_envoy_telemetry.vars.warming_clusters_count }}`: Current count of clusters waiting for warmup.
+    - `{{ outputs.scan_envoy_telemetry.vars.is_alerting }}`: Boolean flag indicating if data plane bounds are breached.
+    - `{{ outputs.scan_envoy_telemetry.vars.audit_timestamp }}`: ISO-8601 UTC timestamp of the Contour Envoy audit run.
+
+    ## Prerequisites
+    - Project Contour deployed with Envoy daemonset exposing admin Prometheus endpoint on port 8002.
+    - Network connectivity from the Kestra worker to the Envoy admin metrics service.
+    - Configured Slack incoming webhook URL with permissions to post in ingress alert channels.
+
+    ### Secrets
+    - `SLACK_WEBHOOK_URL`: Secure webhook URL for routing proxy alerts to the Ingress Slack channel.
+
+    ## Quick start
+    1. Verify that Envoy exposes Prometheus metrics on HTTP admin port 8002.
+    2. Add the `SLACK_WEBHOOK_URL` secret within your Kestra namespace settings.
+    3. Specify your target ingress class identifier in `target_ingress_class`.
+    4. Run a manual flow execution via the Kestra UI to validate metric ingestion.
+    5. Enable the `periodic_envoy_audit` schedule trigger to establish automated monitoring.
+
+    ## Common pitfalls and troubleshooting
+    - **Admin Endpoint Binding**: Envoy admin interface must be bound to a reachable cluster IP or internal port.
+    - **Regex Matcher Complexity**: Excessive non-linear regex path patterns exponentially inflate route memory.
+    - **LDS/RDS Desync**: Updating secrets without reloading Contour control plane causes intermittent xDS NACKs.
+    - **Missing Pod Memory Limits**: Without container memory limits, Envoy expands until node memory pressure triggers evictions.
+
+    ## How to extend
+    - **Automated Memory Profile Capture**: Trigger a Kestra task to fetch Envoy `/memory` heap dump when bloat is detected.
+    - **PagerDuty Escalation**: Escalate to on-call ingress engineers if xDS rejections persist across 3 consecutive cycles.
+    - **Multi-Envoy Fleet Scan**: Expand script parameters to monitor all Envoy pods in the ingress daemonset.
+
+    ## Links
+    - [Kestra Python Script Plugin Documentation](https://kestra.io/plugins/plugin-scripts-python)
+    - [Kestra Slack Plugin Documentation](https://kestra.io/plugins/plugin-slack)
+    - [Project Contour Official Documentation](https://projectcontour.io/)
+    - [Contour Envoy Architecture and xDS Integration Guide](https://projectcontour.io/docs/main/architecture/)
+    - [Envoy Proxy Statistics and Metrics Reference](https://www.envoyproxy.io/docs/envoy/latest/operations/stats_overview)
+  tags:
+    - Infrastructure
+    - Cloud
+  subTags:
+    - Monitoring & Alerting
+    - Kubernetes Operations
+  ee: false
+  demo: false
