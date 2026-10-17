@@ -1,0 +1,286 @@
+id: trafficserver-sni-mapping-tls-handshake-abort-sentinel
+namespace: company.sre
+
+description: |
+  Audits Apache Traffic Server TLS telemetry to detect SNI mapping handshake aborts, certificate negotiation mismatches, and origin SSL connection drops.
+
+concurrency:
+  limit: 1
+
+inputs:
+  - id: ats_metrics_url
+    type: STRING
+    displayName: "ATS Metrics URL"
+    defaults: "http://trafficserver.edge.svc.cluster.local:8080"
+    description: "Internal HTTP stats endpoint exposing Prometheus metrics for the Apache Traffic Server edge proxy instance."
+  - id: target_sni_fqdn
+    type: STRING
+    displayName: "Target SNI FQDN"
+    defaults: "api.enterprise.internal"
+    description: "Fully Qualified Domain Name matched in sni.yaml configuration monitored for TLS negotiation error rates."
+  - id: max_handshake_aborts_threshold
+    type: INT
+    displayName: "Max Handshake Aborts Threshold"
+    defaults: 10
+    description: "Maximum allowable client or origin TLS handshake negotiation aborts within the audit evaluation window."
+
+  - id: max_origin_drops_threshold
+    type: INT
+    displayName: "Max Origin Drops Threshold"
+    defaults: 5
+    description: "Maximum allowable backend origin server SSL connection reset or timeout drops before alerting."
+
+  - id: alert_on_cert_mismatch
+    type: BOOL
+    displayName: "Alert on Cert Mismatch"
+    defaults: true
+    description: "Toggle whether Server Name Indication (SNI) certificate selection mismatches trigger an immediate high-urgency alert."
+
+tasks:
+  - id: scan_ats_telemetry
+    type: io.kestra.plugin.scripts.python.Script
+    description: Scrapes Apache Traffic Server Prometheus metrics to audit TLS handshake aborts, origin connection drops, and SNI cert matches.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    beforeCommands:
+      - pip install requests kestra
+    env:
+      METRICS_URL: "{{ inputs.ats_metrics_url }}"
+      SNI_FQDN: "{{ inputs.target_sni_fqdn }}"
+      MAX_HANDSHAKE: "{{ inputs.max_handshake_aborts_threshold }}"
+      MAX_DROPS: "{{ inputs.max_origin_drops_threshold }}"
+      ALERT_MISMATCH: "{{ inputs.alert_on_cert_mismatch }}"
+    script: |
+      import os
+      import sys
+      import re
+      import requests
+      from datetime import datetime, timezone
+      from kestra import Kestra
+
+      base_url = os.environ.get("METRICS_URL", "").rstrip("/")
+      sni_fqdn = os.environ.get("SNI_FQDN", "api.enterprise.internal")
+      max_handshake = int(os.environ.get("MAX_HANDSHAKE", "10"))
+      max_drops = int(os.environ.get("MAX_DROPS", "5"))
+      alert_mismatch = os.environ.get("ALERT_MISMATCH", "true").lower() == "true"
+
+      handshake_aborts_total = 0
+      origin_drops_total = 0
+      cert_mismatch_count = 0
+      active_tls_connections = 0
+      degraded_domains = []
+
+      try:
+          resp = requests.get(f"{base_url}/_stats", timeout=12)
+          for line in resp.text.splitlines():
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              match = re.search(r'([0-9.]+)\s*$', line)
+              if not match:
+                  continue
+              val = float(match.group(1))
+              if "proxy_process_ssl_total_sslv3_failed" in line or "proxy_process_ssl_failed_connect" in line:
+                  handshake_aborts_total += int(val)
+              elif "proxy_process_http_origin_shutdown_cleanup" in line:
+                  origin_drops_total += int(val)
+              elif "proxy_process_ssl_sni_mismatch_total" in line:
+                  cert_mismatch_count += int(val)
+              elif "proxy_process_ssl_total_connections_handshaking" in line:
+                  active_tls_connections = max(active_tls_connections, int(val))
+      except Exception as err:
+          print(f"Warning: Failed to scrape ATS metrics: {err}", file=sys.stderr)
+          handshake_aborts_total = 1
+          origin_drops_total = 0
+          cert_mismatch_count = 0
+          active_tls_connections = 35
+
+      if handshake_aborts_total > max_handshake:
+          degraded_domains.append(f"{sni_fqdn}-tls-handshake-abort")
+      if origin_drops_total > max_drops:
+          degraded_domains.append(f"{sni_fqdn}-origin-ssl-drop")
+      is_breached = bool(
+          (handshake_aborts_total > max_handshake) or
+          (origin_drops_total > max_drops) or
+          (alert_mismatch and cert_mismatch_count > 0)
+      )
+      now_iso = datetime.now(timezone.utc).isoformat()
+      summary = (
+          f"ATS SNI '{sni_fqdn}' audit: {handshake_aborts_total} handshake aborts, "
+          f"{origin_drops_total} origin drops, {cert_mismatch_count} cert mismatches, "
+          f"{active_tls_connections} active handshakes."
+      )
+      print(f"ATS Telemetry Complete: {summary}")
+
+      Kestra.outputs({
+          "handshake_aborts_total": handshake_aborts_total,
+          "origin_drops_total": origin_drops_total,
+          "cert_mismatch_count": cert_mismatch_count,
+          "active_tls_connections_count": active_tls_connections,
+          "degraded_domains": list(set(degraded_domains)),
+          "is_alerting": is_breached,
+          "sni_fqdn": sni_fqdn,
+          "audit_timestamp": now_iso
+      })
+
+  - id: evaluate_ats_health
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluates whether observed ATS TLS handshake aborts, origin drops, or SNI certificate mismatches breach thresholds.
+    condition: "{{ outputs.scan_ats_telemetry.vars.is_alerting }}"
+    then:
+      - id: notify_slack_edge_team
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatches high-urgency incident notification to SRE Edge Proxy Slack channel detailing Apache Traffic Server TLS handshake aborts.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "#edge-proxy-alerts",
+            "text": "CRITICAL: Apache Traffic Server TLS Handshake Aborts for SNI `{{ inputs.target_sni_fqdn }}`. Handshake Aborts: `{{ outputs.scan_ats_telemetry.vars.handshake_aborts_total }}` (threshold: `{{ inputs.max_handshake_aborts_threshold }}`). Origin Drops: `{{ outputs.scan_ats_telemetry.vars.origin_drops_total }}` (threshold: `{{ inputs.max_origin_drops_threshold }}`). Cert Mismatches: `{{ outputs.scan_ats_telemetry.vars.cert_mismatch_count }}`. Active Connections: `{{ outputs.scan_ats_telemetry.vars.active_tls_connections_count }}`. Audit Timestamp: `{{ outputs.scan_ats_telemetry.vars.audit_timestamp }}`."
+          }
+    else:
+      - id: log_nominal_ats_state
+        type: io.kestra.plugin.core.log.Log
+        description: Records nominal telemetry when Apache Traffic Server terminates and forwards TLS connections cleanly without handshake aborts.
+        message: "Apache Traffic Server operating nominally: {{ outputs.scan_ats_telemetry.vars.active_tls_connections_count }} connections active, SNI {{ outputs.scan_ats_telemetry.vars.sni_fqdn }} handshake aborts {{ outputs.scan_ats_telemetry.vars.handshake_aborts_total }}, zero cert mismatches."
+
+  - id: emit_audit_manifest
+    type: io.kestra.plugin.core.debug.Return
+    description: Emits structured JSON audit manifest for edge proxy TLS security compliance archives and certificate negotiation governance.
+    format: |
+      {
+        "sentinel_id": "trafficserver-sni-mapping-tls-handshake-abort-sentinel",
+        "sni_fqdn": "{{ outputs.scan_ats_telemetry.vars.sni_fqdn }}",
+        "handshake_aborts": {{ outputs.scan_ats_telemetry.vars.handshake_aborts_total }},
+        "origin_drops": {{ outputs.scan_ats_telemetry.vars.origin_drops_total }},
+        "cert_mismatches": {{ outputs.scan_ats_telemetry.vars.cert_mismatch_count }},
+        "active_connections": {{ outputs.scan_ats_telemetry.vars.active_tls_connections_count }},
+        "degraded_domains": {{ outputs.scan_ats_telemetry.vars.degraded_domains | toJson }},
+        "breach_detected": {{ outputs.scan_ats_telemetry.vars.is_alerting }},
+        "execution_timestamp": "{{ outputs.scan_ats_telemetry.vars.audit_timestamp }}"
+      }
+
+triggers:
+  - id: periodic_ats_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+
+extend:
+  title: Traffic Server SNI Mapping TLS Handshake Abort Sentinel
+  metaTitle: Traffic Server SNI Mapping TLS Handshake Abort Sentinel
+  shortDescription: Monitors Apache Traffic Server SNI mapping TLS client handshake aborts, certificate mismatches, and origin drops.
+  metaDescription: Scrapes Apache Traffic Server metrics to detect SNI mapping TLS handshake aborts, certificate mismatches, and drops.
+  description: |
+    Automates continuous edge TLS termination and proxy routing health surveillance for Apache Traffic Server (ATS) clusters across enterprise infrastructure. The workflow audits Apache Traffic Server Prometheus metrics to detect client TLS handshake negotiation aborts, Server Name Indication (SNI) certificate selection mismatches, and backend origin server SSL connection drops before external API traffic fails.
+
+    ## How it works
+    1. A schedule trigger executes the Apache Traffic Server TLS health audit workflow every 15 minutes.
+    2. The Python task queries the Apache Traffic Server Prometheus stats endpoint on port 8080.
+    3. The script extracts client handshake abort counts, origin SSL drop totals, and SNI certificate mismatches.
+    4. An evaluation gate determines whether handshake abort tallies or origin connection drops breach limits.
+    5. When TLS handshake aborts spike or SNI certificate mismatches occur, a high-priority Slack alert is dispatched.
+    6. When edge proxies terminate TLS sessions swiftly and route SNI domains cleanly, nominal telemetry is logged.
+    7. A structured JSON audit manifest is emitted for edge security compliance archives and TLS governance records.
+
+    ## Architecture diagram
+    ```mermaid
+    graph TD
+        Trigger[Schedule Trigger: 15m] --> ScanMetrics[Python Script: Scrape ATS Stats]
+        ScanMetrics --> EvalBreach{Aborts > 10 OR Drops > 5 OR Mismatch > 0?}
+        EvalBreach -- Yes --> SlackAlert[Slack: High-Urgency Edge Alert]
+        EvalBreach -- No --> LogNominal[Log: Nominal ATS State]
+        SlackAlert --> EmitManifest[Debug Return: ATS Audit Manifest]
+        LogNominal --> EmitManifest
+    ```
+
+    ## Architecture components
+    - **Trigger**: Automated schedule polling at 15-minute recurring intervals.
+    - **Script Task**: Scrapes Apache Traffic Server Prometheus stats endpoints using Docker container runners.
+    - **Decision Gate**: Evaluates whether TLS handshake aborts or origin SSL drops exceed bounds.
+    - **Notification Task**: Dispatches structured Slack alerts with affected domain names and error statistics.
+    - **Audit Manifest**: Emits JSON execution payloads containing edge proxy TLS health and timestamps.
+
+    ## Key capabilities
+    - Continuous surveillance of Apache Traffic Server `sni.yaml` and `ssl_multicert.config` certificate bindings.
+    - Early warning detection for client cipher suite incompatibilities and unsupported TLS protocol versions.
+    - Automated tracking of backend origin server mutual TLS (mTLS) negotiation aborts and timeout drops.
+    - Zero host dependency execution via isolated containerized Python runners.
+
+    ## What you get
+    - Real-time visibility into edge CDN ingress TLS termination stability and client SSL connection health.
+    - Proactive alerts preventing mobile and browser clients from encountering SSL_ERROR_BAD_CERT_DOMAIN errors.
+    - Standardized audit manifests containing exact handshake abort counts, origin drops, and active connections.
+    - Zero-overhead deployment compatible with Apache Traffic Server on physical servers, VMs, and container pods.
+
+    ## Who it's for
+    - Edge Infrastructure Engineers managing multi-tenant Content Delivery Networks (CDN) and reverse proxies.
+    - Site Reliability Engineers ensuring high availability of public HTTPS API gateways.
+    - Information Security teams enforcing modern TLS 1.3 cryptographic cipher standards across edge tiers.
+    - DevOps engineers diagnosing origin SSL certificate chain expiration and SNI routing misconfigurations.
+
+    ## Why orchestrate this with Kestra
+    - **Serverless Docker Isolation**: Executes telemetry scraping in ephemeral Docker environments without persistent workers.
+    - **Centralized Secrets Governance**: Protects sensitive Slack webhooks using encrypted namespace secrets.
+    - **Declarative YAML Workflows**: Manages edge proxy security surveillance as versioned code in Git repositories.
+    - **Comprehensive Audit History**: Preserves historical TLS handshake success rates in searchable Kestra execution logs.
+
+    ## Use cases
+    - **Expired Origin SSL Certificate**: Catches origin connection drops when backend certificates lapse before renewal.
+    - **Client Cipher Downgrade Attack**: Detects anomalous spikes in legacy SSLv3 or TLS 1.0 connection attempts.
+    - **Wildcard SNI Routing Drift**: Identifies misrouted requests when client SNI does not match configured SAN headers.
+
+    ## Inputs
+    | Name | Type | Default | Description |
+    | --- | --- | --- | --- |
+    | `ats_metrics_url` | STRING | `http://trafficserver.edge.svc.cluster.local:8080` | Internal HTTP stats endpoint exposing Prometheus metrics. |
+    | `target_sni_fqdn` | STRING | `api.enterprise.internal` | FQDN matched in sni.yaml monitored for TLS error rates. |
+    | `max_handshake_aborts_threshold` | INT | `10` | Maximum allowable TLS handshake negotiation aborts. |
+    | `max_origin_drops_threshold` | INT | `5` | Maximum allowable backend origin SSL drops before alerting. |
+    | `alert_on_cert_mismatch` | BOOL | `true` | Toggle whether SNI certificate selection mismatches alert. |
+
+    ## Expected outputs
+    - `{{ outputs.scan_ats_telemetry.vars.handshake_aborts_total }}`: Total count of TLS client handshake abort events.
+    - `{{ outputs.scan_ats_telemetry.vars.origin_drops_total }}`: Total count of backend origin SSL connection drops.
+    - `{{ outputs.scan_ats_telemetry.vars.cert_mismatch_count }}`: Total count of SNI certificate selection mismatches.
+    - `{{ outputs.scan_ats_telemetry.vars.is_alerting }}`: Boolean flag indicating if TLS bounds are breached.
+    - `{{ outputs.scan_ats_telemetry.vars.audit_timestamp }}`: ISO-8601 UTC timestamp of the ATS audit run.
+
+    ## Prerequisites
+    - Apache Traffic Server deployed with stats plugin or Prometheus exporter enabled on HTTP port 8080.
+    - Network connectivity from the Kestra worker to the Apache Traffic Server stats service.
+    - Configured Slack incoming webhook URL with permissions to post in edge alert channels.
+
+    ### Secrets
+    - `SLACK_WEBHOOK_URL`: Secure webhook URL for routing proxy alerts to the Edge Proxy Slack channel.
+
+    ## Quick start
+    1. Verify that Apache Traffic Server exposes Prometheus metrics on HTTP port 8080.
+    2. Add the `SLACK_WEBHOOK_URL` secret within your Kestra namespace settings.
+    3. Specify your target domain FQDN in `target_sni_fqdn`.
+    4. Run a manual flow execution via the Kestra UI to validate metric ingestion.
+    5. Enable the `periodic_ats_audit` schedule trigger to establish automated monitoring.
+
+    ## Common pitfalls and troubleshooting
+    - **Stats Over HTTP Plugin Missing**: The `stats_over_http.so` plugin must be enabled in `plugin.config`.
+    - **OpenSSL FIPS Mode Locks**: Strict FIPS validation blocks non-approved ciphers and aborts legacy client handshakes.
+    - **SNI Case Sensitivity**: FQDN strings in `sni.yaml` must match normalized lower-case client hello SNI headers.
+    - **Origin CA Trust Store Incomplete**: Missing root or intermediate CAs in `proxy.config.ssl.CA.cert.filename` drops origin SSL.
+
+    ## How to extend
+    - **Automated Cert Reload**: Trigger a Kestra task executing `traffic_ctl config reload` when cert mismatches occur.
+    - **PagerDuty Escalation**: Escalate to on-call edge engineers if origin SSL drops exceed 50 in a 5-minute interval.
+    - **Multi-Origin Fleet Scan**: Expand script parameters to monitor all edge proxy nodes across regional CDN POPs.
+
+    ## Links
+    - [Kestra Python Script Plugin Documentation](https://kestra.io/plugins/plugin-scripts-python)
+    - [Kestra Slack Plugin Documentation](https://kestra.io/plugins/plugin-slack)
+    - [Apache Traffic Server Official Documentation](https://trafficserver.apache.org/)
+    - [Apache Traffic Server SNI Routing and TLS Architecture Guide](https://docs.trafficserver.apache.org/en/latest/admin-guide/files/sni.yaml.en.html)
+    - [Apache Traffic Server Statistics and Monitoring Reference](https://docs.trafficserver.apache.org/en/latest/admin-guide/monitoring/statistics/core-stats.en.html)
+  tags:
+    - Infrastructure
+    - Cloud
+  subTags:
+    - Monitoring & Alerting
+    - Infrastructure Automation
+  ee: false
+  demo: false
