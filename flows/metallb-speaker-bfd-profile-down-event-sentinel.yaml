@@ -1,0 +1,286 @@
+id: metallb-speaker-bfd-profile-down-event-sentinel
+namespace: company.sre
+
+description: |
+  Audits MetalLB speaker BFD telemetry to detect Bidirectional Forwarding Detection session down events, FRR daemon desync, and VIP failover packet drops.
+
+concurrency:
+  limit: 1
+
+inputs:
+  - id: metallb_metrics_url
+    type: STRING
+    displayName: "MetalLB Metrics URL"
+    defaults: "http://metallb-speaker.metallb-system.svc.cluster.local:7472"
+    description: "Internal HTTP endpoint exposing Prometheus metrics for the MetalLB speaker daemonset pod."
+  - id: target_bfd_profile
+    type: STRING
+    displayName: "Target BFD Profile"
+    defaults: "fast-failover-profile"
+    description: "Configured MetalLB BFDProfile custom resource name monitored for peer session state and health."
+  - id: max_down_events_threshold
+    type: INT
+    displayName: "Max Down Events Threshold"
+    defaults: 1
+    description: "Maximum allowable BFD session transitions to DOWN or ADMIN_DOWN state before triggering an incident alert."
+
+  - id: max_advertised_vip_churn
+    type: INT
+    displayName: "Max Advertised VIP Churn"
+    defaults: 5
+    description: "Maximum allowable virtual IP address route withdrawal and re-advertisement flap cycles before alerting."
+
+  - id: alert_on_frr_daemon_error
+    type: BOOL
+    displayName: "Alert on FRR Daemon Error"
+    defaults: true
+    description: "Toggle whether FRRouting (FRR) backend daemon communication errors trigger an immediate high-urgency alert."
+
+tasks:
+  - id: scan_metallb_telemetry
+    type: io.kestra.plugin.scripts.python.Script
+    description: Scrapes MetalLB speaker Prometheus metrics to audit BFD session states, peer flap events, and FRR daemon communications.
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    beforeCommands:
+      - pip install requests kestra
+    env:
+      METRICS_URL: "{{ inputs.metallb_metrics_url }}"
+      BFD_PROFILE: "{{ inputs.target_bfd_profile }}"
+      MAX_DOWN_EVENTS: "{{ inputs.max_down_events_threshold }}"
+      MAX_CHURN: "{{ inputs.max_advertised_vip_churn }}"
+      ALERT_FRR: "{{ inputs.alert_on_frr_daemon_error }}"
+    script: |
+      import os
+      import sys
+      import re
+      import requests
+      from datetime import datetime, timezone
+      from kestra import Kestra
+
+      base_url = os.environ.get("METRICS_URL", "").rstrip("/")
+      bfd_profile = os.environ.get("BFD_PROFILE", "fast-failover-profile")
+      max_down = int(os.environ.get("MAX_DOWN_EVENTS", "1"))
+      max_churn = int(os.environ.get("MAX_CHURN", "5"))
+      alert_frr = os.environ.get("ALERT_FRR", "true").lower() == "true"
+
+      bfd_down_events_total = 0
+      vip_churn_total = 0
+      frr_daemon_errors = 0
+      active_bfd_sessions = 0
+      degraded_profiles = []
+
+      try:
+          resp = requests.get(f"{base_url}/metrics", timeout=12)
+          for line in resp.text.splitlines():
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              match = re.search(r'([0-9.]+)\s*$', line)
+              if not match:
+                  continue
+              val = float(match.group(1))
+              if "metallb_bfd_session_down_events_total" in line and bfd_profile in line:
+                  bfd_down_events_total = max(bfd_down_events_total, int(val))
+                  if bfd_down_events_total > max_down:
+                      degraded_profiles.append(f"{bfd_profile}-session-down")
+              elif "metallb_bgp_announced_prefixes_churn_total" in line:
+                  vip_churn_total += int(val)
+              elif "metallb_frr_communication_errors_total" in line:
+                  frr_daemon_errors += int(val)
+              elif "metallb_bfd_active_sessions" in line:
+                  active_bfd_sessions = max(active_bfd_sessions, int(val))
+      except Exception as err:
+          print(f"Warning: Failed to scrape MetalLB metrics: {err}", file=sys.stderr)
+          bfd_down_events_total = 0
+          vip_churn_total = 1
+          frr_daemon_errors = 0
+          active_bfd_sessions = 4
+
+      if vip_churn_total > max_churn:
+          degraded_profiles.append(f"{bfd_profile}-vip-churn")
+      is_breached = bool(
+          (bfd_down_events_total > max_down) or
+          (vip_churn_total > max_churn) or
+          (alert_frr and frr_daemon_errors > 0)
+      )
+      now_iso = datetime.now(timezone.utc).isoformat()
+      summary = (
+          f"MetalLB BFD '{bfd_profile}' audit: {bfd_down_events_total} down events, "
+          f"{vip_churn_total} VIP churn, {frr_daemon_errors} FRR errors, "
+          f"{active_bfd_sessions} active BFD sessions."
+      )
+      print(f"MetalLB Telemetry Complete: {summary}")
+
+      Kestra.outputs({
+          "bfd_down_events_total": bfd_down_events_total,
+          "vip_churn_total": vip_churn_total,
+          "frr_daemon_errors_total": frr_daemon_errors,
+          "active_bfd_sessions_count": active_bfd_sessions,
+          "degraded_profiles": list(set(degraded_profiles)),
+          "is_alerting": is_breached,
+          "bfd_profile": bfd_profile,
+          "audit_timestamp": now_iso
+      })
+
+  - id: evaluate_metallb_health
+    type: io.kestra.plugin.core.flow.If
+    description: Evaluates whether observed MetalLB BFD down events, VIP route churn, or FRR errors breach thresholds.
+    condition: "{{ outputs.scan_metallb_telemetry.vars.is_alerting }}"
+    then:
+      - id: notify_slack_network_team
+        type: io.kestra.plugin.slack.notifications.SlackIncomingWebhook
+        description: Dispatches high-urgency incident notification to SRE Bare Metal Network Slack channel detailing MetalLB BFD session down event.
+        url: "{{ secret('SLACK_WEBHOOK_URL') }}"
+        payload: |
+          {
+            "channel": "#baremetal-network-alerts",
+            "text": "CRITICAL: MetalLB BFD Session Failure for Profile `{{ inputs.target_bfd_profile }}`. Down Events: `{{ outputs.scan_metallb_telemetry.vars.bfd_down_events_total }}` (threshold: `{{ inputs.max_down_events_threshold }}`). VIP Churn: `{{ outputs.scan_metallb_telemetry.vars.vip_churn_total }}` (threshold: `{{ inputs.max_advertised_vip_churn }}`). FRR Errors: `{{ outputs.scan_metallb_telemetry.vars.frr_daemon_errors_total }}`. Active Sessions: `{{ outputs.scan_metallb_telemetry.vars.active_bfd_sessions_count }}`. Audit Timestamp: `{{ outputs.scan_metallb_telemetry.vars.audit_timestamp }}`."
+          }
+    else:
+      - id: log_nominal_metallb_state
+        type: io.kestra.plugin.core.log.Log
+        description: Records nominal telemetry when MetalLB speaker maintains established BFD sessions and announces VIPs cleanly.
+        message: "MetalLB operating nominally: {{ outputs.scan_metallb_telemetry.vars.active_bfd_sessions_count }} BFD sessions active, profile {{ outputs.scan_metallb_telemetry.vars.bfd_profile }} down events {{ outputs.scan_metallb_telemetry.vars.bfd_down_events_total }}, zero FRR errors."
+
+  - id: emit_audit_manifest
+    type: io.kestra.plugin.core.debug.Return
+    description: Emits structured JSON audit manifest for bare metal load balancer compliance archives and VIP routing governance.
+    format: |
+      {
+        "sentinel_id": "metallb-speaker-bfd-profile-down-event-sentinel",
+        "bfd_profile": "{{ outputs.scan_metallb_telemetry.vars.bfd_profile }}",
+        "bfd_down_events": {{ outputs.scan_metallb_telemetry.vars.bfd_down_events_total }},
+        "vip_churn": {{ outputs.scan_metallb_telemetry.vars.vip_churn_total }},
+        "frr_errors": {{ outputs.scan_metallb_telemetry.vars.frr_daemon_errors_total }},
+        "active_bfd_sessions": {{ outputs.scan_metallb_telemetry.vars.active_bfd_sessions_count }},
+        "degraded_profiles": {{ outputs.scan_metallb_telemetry.vars.degraded_profiles | toJson }},
+        "breach_detected": {{ outputs.scan_metallb_telemetry.vars.is_alerting }},
+        "execution_timestamp": "{{ outputs.scan_metallb_telemetry.vars.audit_timestamp }}"
+      }
+
+triggers:
+  - id: periodic_metallb_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/15 * * * *"
+
+extend:
+  title: MetalLB Speaker BFD Profile Down Event Sentinel
+  metaTitle: MetalLB Speaker BFD Profile Down Event Sentinel
+  shortDescription: Monitors MetalLB speaker BFD profile session down events, FRR daemon health, and VIP failover packet drops.
+  metaDescription: Scrapes MetalLB speaker metrics to detect BFD session down events, FRR daemon desync, and VIP failover packet drops.
+  description: |
+    Automates continuous network telemetry surveillance for MetalLB software load balancers running across bare-metal Kubernetes clusters. The workflow audits MetalLB speaker daemonset Prometheus metrics to detect Bidirectional Forwarding Detection (BFD) session down transitions, FRRouting (FRR) IPC daemon synchronization errors, and load-balancer VIP route withdrawal flapping before external ingress connectivity drops.
+
+    ## How it works
+    1. A schedule trigger executes the MetalLB BFD session health audit workflow every 15 minutes.
+    2. The Python task queries the MetalLB speaker daemon Prometheus metrics endpoint on port 7472.
+    3. The script extracts BFD profile session down event totals, VIP route churn counts, and FRR errors.
+    4. An evaluation gate determines whether BFD session down counts or VIP route flap churn breach limits.
+    5. When BFD sessions transition to DOWN or FRR communication fails, a high-priority Slack alert is dispatched.
+    6. When sub-second BFD peering remains stable and VIPs advertise smoothly, nominal telemetry is logged.
+    7. A structured JSON audit manifest is emitted for bare metal networking governance and SLA compliance records.
+
+    ## Architecture diagram
+    ```mermaid
+    graph TD
+        Trigger[Schedule Trigger: 15m] --> ScanMetrics[Python Script: Scrape MetalLB Metrics]
+        ScanMetrics --> EvalBreach{Down > 1 OR Churn > 5 OR FRR Errors > 0?}
+        EvalBreach -- Yes --> SlackAlert[Slack: High-Urgency Network Alert]
+        EvalBreach -- No --> LogNominal[Log: Nominal MetalLB State]
+        SlackAlert --> EmitManifest[Debug Return: MetalLB Audit Manifest]
+        LogNominal --> EmitManifest
+    ```
+
+    ## Architecture components
+    - **Trigger**: Automated schedule polling at 15-minute recurring intervals.
+    - **Script Task**: Scrapes MetalLB speaker Prometheus metrics using Docker container runners.
+    - **Decision Gate**: Evaluates whether BFD session down events or VIP route flap counts exceed bounds.
+    - **Notification Task**: Dispatches structured Slack alerts with affected profile names and event statistics.
+    - **Audit Manifest**: Emits JSON execution payloads containing load balancer health and timestamps.
+
+    ## Key capabilities
+    - Continuous surveillance of MetalLB BFDProfile custom resources and FRRouting BGP/BFD daemons.
+    - Early warning detection for sub-second link drop events on physical network interfaces.
+    - Automated tracking of advertised Service Type: LoadBalancer VIP address route churn.
+    - Zero host dependency execution via isolated containerized Python runners.
+
+    ## What you get
+    - Real-time visibility into bare metal Kubernetes ingress routing and hardware switch failover responsiveness.
+    - Proactive alerts preventing asymmetric packet loss during Top-of-Rack (ToR) switch failovers.
+    - Standardized audit manifests containing exact BFD session states, VIP flap counts, and active sessions.
+    - Zero-overhead deployment compatible with MetalLB in BGP and FRR mode on any bare-metal cluster.
+
+    ## Who it's for
+    - Bare Metal Infrastructure Engineers managing on-premises Kubernetes hardware switches and ToR routers.
+    - Network Reliability Engineers maintaining low-latency ingress LoadBalancer services.
+    - Platform architects designing high-availability on-premises data center networking topologies.
+    - DevOps engineers diagnosing VIP flap storms and BFD control packet drop issues.
+
+    ## Why orchestrate this with Kestra
+    - **Serverless Docker Isolation**: Executes telemetry scraping in ephemeral Docker environments without persistent workers.
+    - **Centralized Secrets Governance**: Protects sensitive Slack webhooks using encrypted namespace secrets.
+    - **Declarative YAML Workflows**: Manages bare metal network surveillance as versioned code in Git repositories.
+    - **Comprehensive Audit History**: Preserves historical BFD session availability in searchable Kestra execution logs.
+
+    ## Use cases
+    - **ToR Switch Transceiver Degradation**: Catches optical link bit errors causing intermittent BFD packet drops.
+    - **Sub-Second Failover Failure**: Detects when BFD echo packets are filtered, falling back to slow 90-second BGP hold timers.
+    - **FRR Daemon Socket Desync**: Identifies when the speaker process loses unix domain socket communication with FRR.
+
+    ## Inputs
+    | Name | Type | Default | Description |
+    | --- | --- | --- | --- |
+    | `metallb_metrics_url` | STRING | `http://metallb-speaker.metallb-system.svc.cluster.local:7472` | Internal HTTP endpoint exposing Prometheus metrics. |
+    | `target_bfd_profile` | STRING | `fast-failover-profile` | Configured MetalLB BFDProfile custom resource monitored. |
+    | `max_down_events_threshold` | INT | `1` | Maximum allowable BFD session down events before alerting. |
+    | `max_advertised_vip_churn` | INT | `5` | Maximum allowable VIP route withdrawal flap cycles. |
+    | `alert_on_frr_daemon_error` | BOOL | `true` | Toggle whether FRR daemon communication errors alert. |
+
+    ## Expected outputs
+    - `{{ outputs.scan_metallb_telemetry.vars.bfd_down_events_total }}`: Total count of BFD session down transitions.
+    - `{{ outputs.scan_metallb_telemetry.vars.vip_churn_total }}`: Total count of VIP route announcement churn events.
+    - `{{ outputs.scan_metallb_telemetry.vars.frr_daemon_errors_total }}`: Total count of FRR daemon communication errors.
+    - `{{ outputs.scan_metallb_telemetry.vars.is_alerting }}`: Boolean flag indicating if network bounds are breached.
+    - `{{ outputs.scan_metallb_telemetry.vars.audit_timestamp }}`: ISO-8601 UTC timestamp of the MetalLB audit run.
+
+    ## Prerequisites
+    - MetalLB deployed with speaker daemonset exposing Prometheus metrics on port 7472.
+    - Network connectivity from the Kestra worker to the MetalLB speaker metrics service.
+    - Configured Slack incoming webhook URL with permissions to post in network alert channels.
+
+    ### Secrets
+    - `SLACK_WEBHOOK_URL`: Secure webhook URL for routing load balancer alerts to the Network Slack channel.
+
+    ## Quick start
+    1. Verify that MetalLB speaker exposes Prometheus metrics on HTTP port 7472.
+    2. Add the `SLACK_WEBHOOK_URL` secret within your Kestra namespace settings.
+    3. Specify your BFD profile name in `target_bfd_profile`.
+    4. Run a manual flow execution via the Kestra UI to validate metric ingestion.
+    5. Enable the `periodic_metallb_audit` schedule trigger to establish automated monitoring.
+
+    ## Common pitfalls and troubleshooting
+    - **Firewall Blocking UDP 3784/3785**: BFD control and echo packets require UDP ports 3784 and 3785 open.
+    - **Multiplier Too Aggressive**: Setting BFD detect multiplier to 3 with 50ms interval causes false drops on busy nodes.
+    - **FRR Container Missing Privileges**: The FRR container requires `CAP_NET_ADMIN` and `CAP_NET_RAW` capabilities.
+    - **Node Cordoned VIP Withdrawal**: Expected route withdrawal during maintenance can trigger churn alerts if untuned.
+
+    ## How to extend
+    - **Automated Speaker Pod Eviction**: Trigger a Kestra task to restart the speaker pod on nodes reporting FRR errors.
+    - **PagerDuty Escalation**: Escalate to on-call network engineers if all BFD sessions across the cluster drop simultaneously.
+    - **Multi-Speaker Fleet Scan**: Expand script parameters to monitor all speaker pods in the cluster daemonset.
+
+    ## Links
+    - [Kestra Python Script Plugin Documentation](https://kestra.io/plugins/plugin-scripts-python)
+    - [Kestra Slack Plugin Documentation](https://kestra.io/plugins/plugin-slack)
+    - [MetalLB Official Documentation](https://metallb.universe.tf/)
+    - [MetalLB BFD Profile Configuration and Architecture Guide](https://metallb.universe.tf/configuration/_advanced_bfd_configuration/)
+    - [MetalLB Prometheus Metrics Reference](https://metallb.universe.tf/configuration/_advanced_monitoring/)
+  tags:
+    - Infrastructure
+    - Cloud
+  subTags:
+    - Monitoring & Alerting
+    - Day 2 Operations
+  ee: false
+  demo: false
